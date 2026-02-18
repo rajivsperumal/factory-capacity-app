@@ -4,6 +4,7 @@
 // Copy this entire section first
 
 import React, { useState, useEffect } from 'react';
+
 import { Calendar, Upload, Check, X, TrendingUp, AlertCircle, Settings, Users, DollarSign, Package, Clock, Filter, Download, ChevronDown, ChevronRight, Edit2, Save, Eye, Bell, Menu, RefreshCw, LogOut, UserPlus, Trash2, FileText } from 'lucide-react';
 
 // ====================================
