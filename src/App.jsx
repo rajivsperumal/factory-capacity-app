@@ -44,12 +44,26 @@ const api = {
 const normalizeEmail = (email = '') => email.trim().toLowerCase();
 const normalizeString = (value = '') => value.toString().trim();
 
-const getVendorEmail = (vendor) => normalizeEmail(
-    vendor.login_email || vendor.email || vendor.gmail_id || vendor.vendor_email || vendor.email_id || ''
-);
+const getVendorEmail = (vendor) => {
+    // First try designated fields
+    const designated = normalizeEmail(
+        vendor.login_email || vendor.email || vendor.gmail_id || vendor.vendor_email || vendor.email_id || ''
+    );
+    if (designated) return designated;
 
-const getVendorPassword = (vendor) =>
-    normalizeString(vendor.password || vendor.vendor_password || vendor.login_password || vendor.passcode || '');
+    // Fallback: scan all values for something that looks like an email
+    for (const key in vendor) {
+        const val = String(vendor[key] || '').trim();
+        if (val.includes('@') && val.includes('.')) return normalizeEmail(val);
+    }
+    return '';
+};
+
+const getVendorPassword = (vendor) => {
+    const designated = normalizeString(vendor.password || vendor.vendor_password || vendor.login_password || vendor.passcode || '');
+    if (designated) return designated;
+    return '';
+};
 
 const getUserEmail = (user) => normalizeEmail(
     user.email || user.gmail_id || user.login_email || user.username || user.user_email || ''
@@ -150,7 +164,7 @@ const App = () => {
                 password
             });
 
-            if (authResult && !authResult.error) {
+            if (authResult && authResult.success) {
                 if (adminEmailMatch && (authResult.role === 'admin' || authResult.is_admin)) {
                     setIsAdmin(true);
                     setSelectedVendor(null);
@@ -162,7 +176,28 @@ const App = () => {
 
                 const vendorId = authResult.vendor_id || authResult.id;
                 if (vendorId) {
-                    matchedVendor = vendors.find(v => v.id === vendorId) || null;
+                    // First try to find in already-loaded vendors list
+                    matchedVendor = vendors.find(v =>
+                        String(v.id) === String(vendorId)
+                    ) || null;
+
+                    // If not found in vendors list (column mismatch etc), build from auth response
+                    if (!matchedVendor && authResult.vendor_name) {
+                        matchedVendor = {
+                            id: String(vendorId),
+                            name: authResult.vendor_name,
+                            type: authResult.tracking_type || 'unit',
+                            subDeptMode: authResult.subdept_mode || 'vendor',
+                            status: String(authResult.status || 'active').toLowerCase(),
+                            loginEmail: normalizedEmail
+                        };
+                        // Also add to vendors state so the rest of the app works
+                        setVendors(prev => {
+                            const exists = prev.some(v => String(v.id) === String(vendorId));
+                            if (exists) return prev;
+                            return [...prev, matchedVendor];
+                        });
+                    }
                 }
             } else if (authResult && authResult.error) {
                 authErrorMessage = authResult.error;
@@ -174,9 +209,9 @@ const App = () => {
         // Secondary fallback: users sheet style dataset.
         if (!matchedVendor) {
             const matchedUser = authUsers.find(user =>
-                user.status === 'active' &&
-                user.email === normalizedEmail &&
-                user.password === password
+                String(user.status || 'active').toLowerCase() === 'active' &&
+                String(user.email || '').toLowerCase() === normalizedEmail &&
+                String(user.password || '') === String(password)
             ) || null;
 
             if (matchedUser) {
@@ -190,7 +225,7 @@ const App = () => {
                 }
 
                 if (matchedUser.vendorId) {
-                    matchedVendor = vendors.find(v => v.id === matchedUser.vendorId) || null;
+                    matchedVendor = vendors.find(v => String(v.id) === String(matchedUser.vendorId)) || null;
                 }
             }
         }
@@ -1989,12 +2024,10 @@ const PendingApprovals = ({ vendors, onApprove }) => {
 
     const downloadCsv = (detail, vendorName) => {
         const snapshot = detail.data_snapshot;
-        if (!snapshot) return;
 
         // If raw CSV content was stored, use it directly
-        const csvContent = snapshot.csv_content;
-        if (csvContent) {
-            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        if (snapshot && snapshot.csv_content) {
+            const blob = new Blob([snapshot.csv_content], { type: 'text/csv;charset=utf-8;' });
             const url = URL.createObjectURL(blob);
             const link = document.createElement('a');
             link.href = url;
@@ -2006,12 +2039,15 @@ const PendingApprovals = ({ vendors, onApprove }) => {
             return;
         }
 
-        // Fallback: reconstruct CSV from entries in snapshot
-        const entries = snapshot.entries || [];
-        if (entries.length === 0) return;
+        // Fallback: reconstruct CSV from entries in snapshot (or from getCapacity fallback)
+        const entries = (snapshot && snapshot.entries) ? snapshot.entries : [];
+        if (entries.length === 0) {
+            alert('No data available to download for this submission.');
+            return;
+        }
 
         const hasSubdept = entries.some(e => e.subdept);
-        const hasDollarLimit = snapshot.dollar_limit != null;
+        const hasDollarLimit = snapshot && snapshot.dollar_limit != null;
         let headers = ['week_number'];
         if (hasSubdept) headers.push('subdept');
         headers.push('capacity_value');
@@ -2228,7 +2264,7 @@ const PendingApprovals = ({ vendors, onApprove }) => {
                                 </div>
 
                                 {/* CSV Download Button for bulk uploads */}
-                                {sub.submission_type === 'bulk_upload' && submissionDetails[sub.submission_id] && !submissionDetails[sub.submission_id]._noData && submissionDetails[sub.submission_id].data_snapshot && (
+                                {sub.submission_type === 'bulk_upload' && submissionDetails[sub.submission_id] && !submissionDetails[sub.submission_id]._noData && (
                                     <div style={{ marginBottom: '1rem' }}>
                                         <button
                                             onClick={() => downloadCsv(submissionDetails[sub.submission_id], vendor ? vendor.name : sub.vendor_id)}
@@ -2247,7 +2283,9 @@ const PendingApprovals = ({ vendors, onApprove }) => {
                                             }}
                                         >
                                             <Download size={16} />
-                                            Download Uploaded CSV
+                                            {submissionDetails[sub.submission_id].data_snapshot && submissionDetails[sub.submission_id].data_snapshot.csv_content
+                                                ? 'Download Uploaded CSV'
+                                                : 'Download Submitted Data (CSV)'}
                                         </button>
                                     </div>
                                 )}
