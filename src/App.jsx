@@ -78,6 +78,45 @@ const getUserVendorId = (user) => normalizeString(
 );
 
 const getUserRole = (user) => normalizeString(user.role || user.user_role || '').toLowerCase();
+const normalizeVendorKey = (value = '') => normalizeString(value).toLowerCase();
+const normalizeSubDeptMode = (value = '') => {
+    const mode = normalizeString(value).toLowerCase();
+    if (!mode) return 'vendor';
+    if (
+        mode === 'subdept' ||
+        mode === 'sub_dept' ||
+        mode === 'sub-dept' ||
+        mode === 'subdepartment' ||
+        mode === 'sub_department' ||
+        mode === 'sub-department' ||
+        mode === 'sebdept' // common typo seen in sheet data
+    ) {
+        return 'subdept';
+    }
+    if (
+        (mode.includes('sub') && mode.includes('dept')) ||
+        (mode.includes('seb') && mode.includes('dept'))
+    ) {
+        return 'subdept';
+    }
+    return 'vendor';
+};
+const resolveVendorFromList = (vendorList, vendorRef) => {
+    const refKey = normalizeVendorKey(vendorRef);
+    if (!refKey || !Array.isArray(vendorList)) return null;
+
+    // Primary: vendor_id match (normalized)
+    let found = vendorList.find(v => normalizeVendorKey(v.id) === refKey) || null;
+    if (found) return found;
+
+    // Fallback: submissions occasionally carry vendor name in vendor_id
+    found = vendorList.find(v => normalizeVendorKey(v.name) === refKey) || null;
+    if (found) return found;
+
+    // Fallback: ignore spaces/underscores/dashes differences
+    const compactRef = refKey.replace(/[\s_-]+/g, '');
+    return vendorList.find(v => normalizeVendorKey(v.id).replace(/[\s_-]+/g, '') === compactRef) || null;
+};
 
 const App = () => {
     const [vendors, setVendors] = useState([]);
@@ -113,7 +152,7 @@ const App = () => {
                     id: v.vendor_id,
                     name: v.vendor_name,
                     type: v.tracking_type,
-                    subDeptMode: v.subdept_mode,
+                    subDeptMode: normalizeSubDeptMode(v.subdept_mode),
                     status: v.status,
                     loginEmail: getVendorEmail(v),
                     loginPassword: getVendorPassword(v)
@@ -156,59 +195,95 @@ const App = () => {
         let matchedVendor = null;
         let authErrorMessage = '';
         const adminEmailMatch = ADMIN_EMAILS.includes(normalizedEmail);
+        let liveUsers = authUsers;
 
-        // Preferred: validate server-side in Apps Script.
+        // Refresh users at login time to avoid stale auth data.
         try {
-            const authResult = await api.post('vendorLogin', {
+            const latestUsers = await api.get('getUsers');
+            if (Array.isArray(latestUsers)) {
+                liveUsers = latestUsers.map(u => ({
+                    email: getUserEmail(u),
+                    password: getUserPassword(u),
+                    vendorId: getUserVendorId(u),
+                    role: getUserRole(u),
+                    status: normalizeString(u.status || 'active').toLowerCase()
+                }));
+                setAuthUsers(liveUsers);
+            }
+        } catch (refreshUsersError) {
+            console.warn('Unable to refresh getUsers during login; using cached users.', refreshUsersError);
+        }
+
+        // 1) Admin authentication (ProductionTeam) from Apps Script.
+        try {
+            const prodAuth = await api.get('authenticateProduction', {
+                email: normalizedEmail,
+                password
+            });
+            if (prodAuth && prodAuth.success) {
+                setIsAdmin(true);
+                setSelectedVendor(null);
+                setLoggedInEmail(normalizedEmail);
+                setPassword('');
+                setLoggingIn(false);
+                return;
+            }
+        } catch (prodAuthError) {
+            console.warn('authenticateProduction check failed, using fallback.', prodAuthError);
+        }
+
+        // 2) Vendor authentication from Apps Script.
+        try {
+            const vendorAuth = await api.get('authenticateVendor', {
                 email: normalizedEmail,
                 password
             });
 
-            if (authResult && authResult.success) {
-                if (adminEmailMatch && (authResult.role === 'admin' || authResult.is_admin)) {
-                    setIsAdmin(true);
-                    setSelectedVendor(null);
-                    setLoggedInEmail(normalizedEmail);
-                    setPassword('');
-                    setLoggingIn(false);
-                    return;
-                }
+            if (vendorAuth && vendorAuth.success) {
+                const vendorId = vendorAuth.vendor_id || vendorAuth.id;
+                const vendorName = normalizeString(vendorAuth.vendor_name || vendorAuth.name || '');
+                const authEmail = normalizeEmail(vendorAuth.login_email || normalizedEmail);
 
-                const vendorId = authResult.vendor_id || authResult.id;
+                // Preferred mapping by vendor_id.
                 if (vendorId) {
-                    // First try to find in already-loaded vendors list
-                    matchedVendor = vendors.find(v =>
-                        String(v.id) === String(vendorId)
-                    ) || null;
-
-                    // If not found in vendors list (column mismatch etc), build from auth response
-                    if (!matchedVendor && authResult.vendor_name) {
-                        matchedVendor = {
-                            id: String(vendorId),
-                            name: authResult.vendor_name,
-                            type: authResult.tracking_type || 'unit',
-                            subDeptMode: authResult.subdept_mode || 'vendor',
-                            status: String(authResult.status || 'active').toLowerCase(),
-                            loginEmail: normalizedEmail
-                        };
-                        // Also add to vendors state so the rest of the app works
-                        setVendors(prev => {
-                            const exists = prev.some(v => String(v.id) === String(vendorId));
-                            if (exists) return prev;
-                            return [...prev, matchedVendor];
-                        });
-                    }
+                    matchedVendor = vendors.find(v => String(v.id) === String(vendorId)) || null;
                 }
-            } else if (authResult && authResult.error) {
-                authErrorMessage = authResult.error;
+
+                // Fallback mapping when Apps Script response doesn't include vendor_id.
+                if (!matchedVendor && authEmail) {
+                    matchedVendor = vendors.find(v => normalizeEmail(v.loginEmail) === authEmail) || null;
+                }
+                if (!matchedVendor && vendorName) {
+                    matchedVendor = vendors.find(v => normalizeString(v.name) === vendorName) || null;
+                }
+
+                // Last resort: synthesize a vendor object so successful auth can proceed.
+                if (!matchedVendor) {
+                    const syntheticId = vendorId || vendorName || authEmail || `vendor-${Date.now()}`;
+                    matchedVendor = {
+                        id: String(syntheticId),
+                        name: vendorName || String(syntheticId),
+                        type: vendorAuth.tracking_type || 'unit',
+                        subDeptMode: normalizeSubDeptMode(vendorAuth.subdept_mode),
+                        status: String(vendorAuth.status || 'active').toLowerCase(),
+                        loginEmail: authEmail
+                    };
+                    setVendors(prev => {
+                        const exists = prev.some(v => String(v.id) === String(matchedVendor.id));
+                        if (exists) return prev;
+                        return [...prev, matchedVendor];
+                    });
+                }
+            } else if (vendorAuth && vendorAuth.error) {
+                authErrorMessage = vendorAuth.error;
             }
-        } catch (authError) {
-            console.warn('vendorLogin action not available, using local vendor lookup fallback.', authError);
+        } catch (vendorAuthError) {
+            console.warn('authenticateVendor check failed, using local fallback.', vendorAuthError);
         }
 
         // Secondary fallback: users sheet style dataset.
         if (!matchedVendor) {
-            const matchedUser = authUsers.find(user =>
+            const matchedUser = liveUsers.find(user =>
                 String(user.status || 'active').toLowerCase() === 'active' &&
                 String(user.email || '').toLowerCase() === normalizedEmail &&
                 String(user.password || '') === String(password)
@@ -231,7 +306,7 @@ const App = () => {
         }
 
         // Admin allowlist fallback (when users sheet is not available).
-        if (adminEmailMatch && !matchedVendor && authUsers.length === 0) {
+        if (adminEmailMatch && !matchedVendor && liveUsers.length === 0) {
             setIsAdmin(true);
             setSelectedVendor(null);
             setLoggedInEmail(normalizedEmail);
@@ -250,13 +325,33 @@ const App = () => {
         }
 
         if (!matchedVendor) {
-            const hasUsersCredentials = authUsers.some(user => user.email && user.password);
+            const hasUsersCredentials = liveUsers.some(user => user.email && user.password);
             const hasVendorCredentials = vendors.some(v => v.loginEmail && normalizeString(v.loginPassword));
             const missingCredentialSources = !hasUsersCredentials && !hasVendorCredentials;
+            const matchingUsersByEmail = liveUsers.filter(user => user.email === normalizedEmail);
+            const matchingVendorsByEmail = vendors.filter(v => v.loginEmail === normalizedEmail);
+            const emailExistsInAuthSources = matchingUsersByEmail.length > 0 || matchingVendorsByEmail.length > 0;
+            const inactiveVendorMatch = matchingVendorsByEmail.some(v => String(v.status || '').toLowerCase() !== 'active');
+            const wrongPasswordInUsers = matchingUsersByEmail.length > 0 && !matchingUsersByEmail.some(user => String(user.password || '') === String(password));
+            const wrongPasswordInVendors = matchingVendorsByEmail.length > 0 && !matchingVendorsByEmail.some(v => normalizeString(v.loginPassword) === normalizeString(password));
+
+            let diagnosticError = 'Invalid Gmail ID/password, or no vendor mapping found.';
+            if (authErrorMessage === 'Invalid credentials') {
+                diagnosticError = 'Invalid Gmail ID/password.';
+            } else if (inactiveVendorMatch) {
+                diagnosticError = 'Your vendor is marked inactive. Contact production team.';
+            } else if (!emailExistsInAuthSources && missingCredentialSources) {
+                diagnosticError = 'Login data not found in Apps Script response. Check Vendors/ProductionTeam sheets and deployed script version.';
+            } else if (!emailExistsInAuthSources) {
+                diagnosticError = 'Email not found in login data. Verify login_email in Vendors or email in ProductionTeam.';
+            } else if (wrongPasswordInUsers || wrongPasswordInVendors) {
+                diagnosticError = 'Password does not match the stored value for this email.';
+            } else if (authErrorMessage === 'Invalid action' && missingCredentialSources) {
+                diagnosticError = 'Login API not configured in Apps Script. Ensure authenticateVendor/getUsers are deployed and login columns exist in sheet data.';
+            }
+
             setLoginError(
-                authErrorMessage === 'Invalid action' && missingCredentialSources
-                    ? 'Login API not configured in Apps Script, and no login columns were found in sheet data. Add getUsers/vendorLogin, or add email/password columns to vendors data.'
-                    : 'Invalid Gmail ID/password, or no vendor mapping found.'
+                diagnosticError
             );
             setLoggingIn(false);
             return;
@@ -1918,6 +2013,7 @@ const PendingApprovals = ({ vendors, onApprove }) => {
     const [submissions, setSubmissions] = useState([]);
     const [loading, setLoading] = useState(true);
     const [submissionDetails, setSubmissionDetails] = useState({});
+    const resolveVendor = (vendorRef) => resolveVendorFromList(vendors, vendorRef);
 
     useEffect(() => {
         loadSubmissions();
@@ -1975,7 +2071,7 @@ const PendingApprovals = ({ vendors, onApprove }) => {
             if (data && data.data_snapshot && !data.data_snapshot.entries) {
                 const snap = data.data_snapshot;
                 const reconstructed = [];
-                const v = vendors.find(vv => String(vv.id) === String(vendorId));
+                const v = resolveVendor(vendorId);
 
                 if (v && v.subDeptMode === 'subdept' && snap.subdept_capacities) {
                     SUB_DEPARTMENTS.forEach(dept => {
@@ -2163,7 +2259,7 @@ const PendingApprovals = ({ vendors, onApprove }) => {
     return (
         <div style={{ display: 'grid', gap: '1rem' }}>
             {submissions.map(sub => {
-                const vendor = vendors.find(v => String(v.id) === String(sub.vendor_id));
+                const vendor = resolveVendor(sub.vendor_id);
 
                 return (
                     <div
